@@ -28,6 +28,12 @@ import {
 } from '../utils/db';
 import { batchLabel, matchScoreBand, roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedIncludes, pickedSelect, type FilterValue } from '../components/common/FilterBar';
+import { useOvenStore } from './ovenStore';
+
+/** 鲜叶重量变化 / 批次删除（级联删道次）后联动重排两座炉 */
+function triggerOvenReschedule(): void {
+  void useOvenStore.getState().reschedule();
+}
 
 /** 批次筛选（/gardens 的批次子表与派生统计复用） */
 export const DEFAULT_BATCH_FILTERS: FilterValue = emptyFilterValue(['gardenIds', 'states', 'tendernesses']);
@@ -269,12 +275,14 @@ export const useBatchStore = create<BatchStoreState>((set, get) => ({
     };
     await putBatch(next);
     await get().loadBatches();
+    triggerOvenReschedule();
   },
 
   async deleteBatch(batchId) {
     await removeBatchRow(batchId);
     set({ blendDraft: get().blendDraft.filter((item) => item.batchId !== batchId) });
     await Promise.all([get().loadBatches(), get().loadReviews()]);
+    triggerOvenReschedule();
   },
 
   async advanceBatchState(batchId) {

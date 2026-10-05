@@ -17,6 +17,7 @@ import {
 } from '../utils/db';
 import { averageScore, roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedIncludes, pickedSelect, type FilterValue } from '../components/common/FilterBar';
+import { useOvenStore } from './ovenStore';
 
 /** 山场页筛选条件默认值：关键字 + 品种 / 土壤 / 海拔分段三个下拉多选 */
 export const DEFAULT_GARDEN_FILTERS: FilterValue = emptyFilterValue(['cultivars', 'soils', 'bands']);
@@ -185,6 +186,8 @@ export const useGardenStore = create<GardenStoreState>((set, get) => ({
     await removeGardenRow(gardenId);
     if (get().currentGardenId === gardenId) set({ currentGardenId: null });
     await get().loadGardens();
+    // 级联删除会带走批次与焙火道次，联动重排两座炉
+    void useOvenStore.getState().reschedule();
   },
 }));
 

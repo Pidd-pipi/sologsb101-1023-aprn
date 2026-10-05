@@ -1,8 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）· 库名 gbtearock
- * - 结构版本号 version(1) 初版 + version(DB_VERSION=2) 升级迁移（真实改写历史数据）
- * - 山场 / 茶青批次 / 做青轮次 / 杀青揉捻 / 焙火 / 审评 六张分表存储
- * - 首屏自动播种互相引用的演示数据（山场 → 批次 → 轮次/杀青/焙火/审评 三层贯通）
+ * - 结构版本号 version(1) 初版 + version(2) 升级迁移 + version(DB_VERSION=3) 新增焙炉 / 炉次表
+ * - 山场 / 茶青批次 / 做青轮次 / 杀青揉捻 / 焙火 / 审评 / 焙炉 / 炉次 八张分表存储
+ * - 首屏自动播种互相引用的演示数据（山场 → 批次 → 轮次/杀青/焙火/审评 三层贯通，另含两座炉与初始炉次）
  * - 纯前端应用：不依赖任何后端、数据库服务或外部接口
  */
 import Dexie, { type Table } from 'dexie';
@@ -12,13 +12,15 @@ import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import { ROAST_STATES, type Roast } from '../types/roast';
 import type { Review } from '../types/review';
+import { DEFAULT_OVEN_SEEDS, type Oven, type OvenRun } from '../types/oven';
 import { clampScore, weightedTotalScore } from './tea';
+import { computeOvenPlan } from './ovenSchedule';
 
 /** 数据库名 = 英文短名 */
 export const DB_NAME = 'gbtearock';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 主键前缀，便于在导出 JSON 里肉眼区分实体 */
 export const ID_PREFIX = {
@@ -28,6 +30,7 @@ export const ID_PREFIX = {
   fix: 'fix',
   roast: 'roast',
   review: 'review',
+  ovenRun: 'ovenrun',
 } as const;
 
 class TeaRockDatabase extends Dexie {
@@ -37,6 +40,8 @@ class TeaRockDatabase extends Dexie {
   fixes!: Table<Fix, string>;
   roasts!: Table<Roast, string>;
   reviews!: Table<Review, string>;
+  ovens!: Table<Oven, string>;
+  ovenRuns!: Table<OvenRun, string>;
 
   constructor() {
     super(DB_NAME);
@@ -154,6 +159,22 @@ class TeaRockDatabase extends Dexie {
             });
           });
       });
+
+    // v3：新增炭焙间两座炉（ovens）与炉次排程（ovenRuns）两张表
+    //     （Dexie 会合并各版本 stores，此处只声明新增表）；
+    //     迁移时为历史库播种两座默认炉，历史焙火记录保持不变，
+    //     炉次排程在打开焙火页时按现有道次自动补齐。
+    this.version(3)
+      .stores({
+        ovens: 'id, name, updatedAt',
+        ovenRuns: 'id, ovenId, date, [ovenId+date], updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const ovenTable = tx.table<Oven, string>('ovens');
+        if ((await ovenTable.count()) === 0) {
+          await ovenTable.bulkPut(defaultOvenRows(nowIso()));
+        }
+      });
   }
 }
 
@@ -163,6 +184,11 @@ export const db = new TeaRockDatabase();
 function clampNumber(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, value));
+}
+
+/** 默认两座炉（固定 id + revision 0，播种与 v3 迁移共用） */
+function defaultOvenRows(stamp: string): Oven[] {
+  return DEFAULT_OVEN_SEEDS.map((seed) => ({ ...seed, revision: 0, createdAt: stamp, updatedAt: stamp }));
 }
 
 /** 当前时间 ISO 字符串 */
@@ -378,7 +404,19 @@ export async function seedDatabase(): Promise<void> {
       tempC: 100,
       hours: 4,
       charcoal: '机制炭',
-      nextRoastDate: '',
+      nextRoastDate: shiftDate(6),
+      state: '待焙',
+      createdAt: stamp,
+      updatedAt: stamp,
+    },
+    {
+      id: 'roast-matou-pass1',
+      batchId: 'batch-matouyan-0508',
+      passNo: 1,
+      tempC: 90,
+      hours: 6,
+      charcoal: '机制炭',
+      nextRoastDate: shiftDate(5),
       state: '待焙',
       createdAt: stamp,
       updatedAt: stamp,
@@ -433,14 +471,31 @@ export async function seedDatabase(): Promise<void> {
     }),
   }));
 
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    if ((await db.gardens.count()) === 0) await db.gardens.bulkPut(gardens);
-    if ((await db.batches.count()) === 0) await db.batches.bulkPut(batches);
-    if ((await db.turns.count()) === 0) await db.turns.bulkPut(turns);
-    if ((await db.fixes.count()) === 0) await db.fixes.bulkPut(fixes);
-    if ((await db.roasts.count()) === 0) await db.roasts.bulkPut(roasts);
-    if ((await db.reviews.count()) === 0) await db.reviews.bulkPut(reviews);
-  });
+  const ovens: Oven[] = defaultOvenRows(stamp);
+
+  // 初始炉次：用排程纯函数从播种道次现算，保证与运行时重排规则一致
+  const seedPlan = computeOvenPlan({ roasts, batches, ovens, existingRuns: [] });
+  const ovenRuns: OvenRun[] = seedPlan.added.map((draft) => ({
+    ...draft,
+    id: createId(ID_PREFIX.ovenRun),
+    createdAt: stamp,
+    updatedAt: stamp,
+  }));
+
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.ovens, db.ovenRuns],
+    async () => {
+      if ((await db.gardens.count()) === 0) await db.gardens.bulkPut(gardens);
+      if ((await db.batches.count()) === 0) await db.batches.bulkPut(batches);
+      if ((await db.turns.count()) === 0) await db.turns.bulkPut(turns);
+      if ((await db.fixes.count()) === 0) await db.fixes.bulkPut(fixes);
+      if ((await db.roasts.count()) === 0) await db.roasts.bulkPut(roasts);
+      if ((await db.reviews.count()) === 0) await db.reviews.bulkPut(reviews);
+      if ((await db.ovens.count()) === 0) await db.ovens.bulkPut(ovens);
+      if ((await db.ovenRuns.count()) === 0) await db.ovenRuns.bulkPut(ovenRuns);
+    },
+  );
 }
 
 /** 播种用的轮次构造器，避免重复字段声明 */
@@ -602,6 +657,52 @@ export async function removeRoast(id: string): Promise<void> {
   await db.roasts.delete(id);
 }
 
+/* ------------------------------ 焙炉与炉次 ------------------------------ */
+
+export async function listOvens(): Promise<Oven[]> {
+  const rows = await db.ovens.toArray();
+  return rows.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+}
+
+export async function listOvenRuns(): Promise<OvenRun[]> {
+  const rows = await db.ovenRuns.toArray();
+  return rows.sort((a, b) => a.date.localeCompare(b.date) || a.ovenId.localeCompare(b.ovenId) || a.runNo - b.runNo);
+}
+
+/** 排程版本冲突：另一标签页已先保存了同一焙炉的排程 */
+export class OvenScheduleConflictError extends Error {
+  constructor() {
+    super('另一标签页已更新炉次排程，本次保存未写入');
+    this.name = 'OvenScheduleConflictError';
+  }
+}
+
+/**
+ * 原子提交炉次排程（乐观锁）：
+ * 事务内逐炉比对 revision 与调用方基准，不一致即抛 OvenScheduleConflictError 并整体回滚，
+ * 绝不覆盖另一标签页已保存的排程；一致则替换旧炉次、写入新炉次并把各炉 revision +1。
+ */
+export async function commitOvenPlan(params: {
+  /** 调用方读取排程时记录的各炉 revision 基准 */
+  baseRevisions: Record<string, number>;
+  /** 被替换 / 清空的旧炉次 id */
+  removeRunIds: string[];
+  /** 需要写入的炉次（新增 + 被修正的冻结炉次） */
+  upsertRuns: OvenRun[];
+}): Promise<Oven[]> {
+  return db.transaction('rw', [db.ovens, db.ovenRuns], async () => {
+    const ovens = await db.ovens.toArray();
+    const stale = ovens.some((oven) => (params.baseRevisions[oven.id] ?? -1) !== oven.revision);
+    if (stale) throw new OvenScheduleConflictError();
+    const stamp = nowIso();
+    const bumped = ovens.map((oven) => ({ ...oven, revision: oven.revision + 1, updatedAt: stamp }));
+    if (params.removeRunIds.length > 0) await db.ovenRuns.bulkDelete(params.removeRunIds);
+    if (params.upsertRuns.length > 0) await db.ovenRuns.bulkPut(params.upsertRuns);
+    await db.ovens.bulkPut(bumped);
+    return bumped;
+  });
+}
+
 /* -------------------------------- 审评 -------------------------------- */
 
 export async function listReviews(): Promise<Review[]> {
@@ -635,53 +736,84 @@ export interface DatabaseSnapshot {
   fixes: Fix[];
   roasts: Roast[];
   reviews: Review[];
+  ovens: Oven[];
+  ovenRuns: OvenRun[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, ovens, ovenRuns] = await Promise.all([
     db.gardens.toArray(),
     db.batches.toArray(),
     db.turns.toArray(),
     db.fixes.toArray(),
     db.roasts.toArray(),
     db.reviews.toArray(),
+    db.ovens.toArray(),
+    db.ovenRuns.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_VERSION, exportedAt: nowIso(), gardens, batches, turns, fixes, roasts, reviews };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_VERSION,
+    exportedAt: nowIso(),
+    gardens,
+    batches,
+    turns,
+    fixes,
+    roasts,
+    reviews,
+    ovens,
+    ovenRuns,
+  };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）；旧版存档缺少焙炉 / 炉次时补种默认两座炉 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    await Promise.all([
-      db.gardens.clear(),
-      db.batches.clear(),
-      db.turns.clear(),
-      db.fixes.clear(),
-      db.roasts.clear(),
-      db.reviews.clear(),
-    ]);
-    await db.gardens.bulkPut(snapshot.gardens);
-    await db.batches.bulkPut(snapshot.batches);
-    await db.turns.bulkPut(snapshot.turns);
-    await db.fixes.bulkPut(snapshot.fixes);
-    await db.roasts.bulkPut(snapshot.roasts);
-    await db.reviews.bulkPut(snapshot.reviews);
-  });
+  const ovens = snapshot.ovens.length > 0 ? snapshot.ovens : defaultOvenRows(nowIso());
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.ovens, db.ovenRuns],
+    async () => {
+      await Promise.all([
+        db.gardens.clear(),
+        db.batches.clear(),
+        db.turns.clear(),
+        db.fixes.clear(),
+        db.roasts.clear(),
+        db.reviews.clear(),
+        db.ovens.clear(),
+        db.ovenRuns.clear(),
+      ]);
+      await db.gardens.bulkPut(snapshot.gardens);
+      await db.batches.bulkPut(snapshot.batches);
+      await db.turns.bulkPut(snapshot.turns);
+      await db.fixes.bulkPut(snapshot.fixes);
+      await db.roasts.bulkPut(snapshot.roasts);
+      await db.reviews.bulkPut(snapshot.reviews);
+      await db.ovens.bulkPut(ovens);
+      if (snapshot.ovenRuns.length > 0) await db.ovenRuns.bulkPut(snapshot.ovenRuns);
+    },
+  );
 }
 
 /** 清空全部表（不重新播种） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    await Promise.all([
-      db.gardens.clear(),
-      db.batches.clear(),
-      db.turns.clear(),
-      db.fixes.clear(),
-      db.roasts.clear(),
-      db.reviews.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.ovens, db.ovenRuns],
+    async () => {
+      await Promise.all([
+        db.gardens.clear(),
+        db.batches.clear(),
+        db.turns.clear(),
+        db.fixes.clear(),
+        db.roasts.clear(),
+        db.reviews.clear(),
+        db.ovens.clear(),
+        db.ovenRuns.clear(),
+      ]);
+    },
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
@@ -692,13 +824,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数概览（页脚与统计徽标使用） */
 export async function countAll(): Promise<Record<string, number>> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, ovens, ovenRuns] = await Promise.all([
     db.gardens.count(),
     db.batches.count(),
     db.turns.count(),
     db.fixes.count(),
     db.roasts.count(),
     db.reviews.count(),
+    db.ovens.count(),
+    db.ovenRuns.count(),
   ]);
-  return { gardens, batches, turns, fixes, roasts, reviews };
+  return { gardens, batches, turns, fixes, roasts, reviews, ovens, ovenRuns };
 }

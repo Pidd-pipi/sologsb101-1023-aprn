@@ -40,7 +40,7 @@ docker compose up -d --build
 | `/gardens` | 山场与茶青批次台账 | 建山场（品种 / 土壤 / 海拔 / 朝向），卡片回显批次数、鲜叶合计与审评均分；登记批次并推进工序状态；整库 JSON 导出 / 导入 |
 | `/turns` | 做青轮次编排 | 摇青 / 静置交替时间线与累计时长、失水率走势；**HTML5 原生拖拽排序**写回 `roundNo`；复制上一轮参数后微调、参数模板存 / 套用 |
 | `/fixing` | 杀青揉捻记录 | 锅温、杀青时长、揉捻压力与时长、操作人登记；登记后自动把批次回写为「已杀青」 |
-| `/roasting` | 焙火曲线与复焙安排 | 多道次按序排列（上移 / 下移写回 `passNo`）、足火判定（轻火 / 中火 / 足火）、复焙提醒（逾期 / 今日 / 7 日内 / 已排期） |
+| `/roasting` | 焙火曲线与复焙安排 | 多道次按序排列（上移 / 下移写回 `passNo`）、足火判定（轻火 / 中火 / 足火）、复焙提醒（逾期 / 今日 / 7 日内 / 已排期）；**炭焙间两座炉排程**：按复焙日期、鲜叶重量与焙火时长自动排炉，同炉超容量排队到下一炉次，已开焙道次保持原样，排不下则恢复原排程并列出待处理批次；多标签页同时排同一炉时后保存方保留方案并列冲突、不覆盖对方 |
 | `/reviews` | 毛茶审评 | 香气 30% / 汤色 20% / 滋味 35% / 叶底 15% 加权换算总分，按总分排序并生成拼配候选清单 |
 | `/blending` | 拼配方案登记与结构版本导出 | 按总分组合批次与占比、**占比校验（合计必须 100%）**、方案 JSON 与整库结构版本 JSON 导出 |
 
@@ -97,18 +97,20 @@ sologsb101-1023/
         ├── App.tsx                 # 外壳：侧边导航、当前山场/批次、行数统计、首次初始化 + 播种
         ├── vite-env.d.ts
         ├── styles/main.css         # 墨绿/茶褐/炭金主题与拖拽、时间线样式
-        ├── types/                  # 六个实体各一文件
+        ├── types/                  # 六个实体各一文件 + 焙炉 / 炉次
         │   ├── garden.ts           # 山场：name / altitudeM / soil / cultivar / aspect
         │   ├── batch.ts            # 茶青批次：gardenId / pickedAt / freshLeafKg / tenderness / weather / state
         │   ├── turn.ts             # 做青轮次：batchId / roundNo / shakeMin / restMin / roomTempC / humidityPct / waterLossPct
         │   ├── fix.ts              # 杀青揉捻：batchId / wokTempC / fixMin / rollPressure / rollMin / operator
         │   ├── roast.ts            # 焙火：batchId / passNo / tempC / hours / charcoal / nextRoastDate / state
-        │   └── review.ts           # 审评：batchId / reviewedAt / aroma / liquorColor / taste / leafBase / totalScore / blendNote
+        │   ├── review.ts           # 审评：batchId / reviewedAt / aroma / liquorColor / taste / leafBase / totalScore / blendNote
+        │   └── oven.ts             # 焙炉与炉次：capacityKg / revision（乐观锁）；ovenId / runNo / date / hours / totalKg / roastIds
         ├── stores/                 # Zustand：跨页状态全部放这里
         │   ├── gardenStore.ts      # 山场列表、派生指标、当前选中山场、筛选条件
         │   ├── batchStore.ts       # 批次与工序流转、杀青/审评/拼配筛选、拼配方案草稿
         │   ├── turnStore.ts        # 当前批次轮次、参数模板、拖拽重排（写回 roundNo）
-        │   └── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
+        │   ├── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
+        │   └── ovenStore.ts        # 两座炉排程、revision 乐观锁、冲突列表与待处理批次
         ├── components/common/      # 共享组件
         │   ├── GradeTag.tsx        # 嫩度 / 火功 / 评分 / 工序状态 / 焙火状态 / 揉捻压力标签
         │   ├── FilterBar.tsx       # 关键字 + 多个下拉多选，并同步 URL query
@@ -119,7 +121,8 @@ sologsb101-1023/
         │   └── useIdbTable.ts      # Dexie 表响应式订阅 + 增删改查封装
         ├── utils/
         │   ├── tea.ts              # 嫩度/火功枚举映射、温湿度与失水率区间判定、评分加权换算、拼配候选
-        │   ├── db.ts               # Dexie 实例、六张表、version(1) + version(2) 迁移、播种、快照导入导出
+        │   ├── ovenSchedule.ts     # 两座炉排程纯函数：拼炉 / 排队到下一炉次、冻结炉次保留、冲突比对
+        │   ├── db.ts               # Dexie 实例、八张表、version(1) + version(2) + version(3) 迁移、播种、快照导入导出
         │   └── export.ts           # 批次工艺记录 / 整库存档 / 拼配方案 JSON 导出与校验
         ├── pages/                  # 六个页面，与路由一一对应
         │   ├── GardenList.tsx      # /gardens
@@ -136,13 +139,15 @@ sologsb101-1023/
 ## 六、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbtearock`（`src/utils/db.ts` 中的 `DB_NAME`）
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1)` 初版结构：六张分表的最小索引
   - `version(2).stores(...)` 补齐外键 / 状态 / 日期索引，并 `.upgrade()` **真实迁移历史数据**：补齐 `createdAt` / `updatedAt`、山场补齐朝向与土壤品种兜底值、批次工序状态归一化、轮次与焙火数值截断到合法区间、审评总分由「四项简单平均」改为「分项加权换算」后重算。
-- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`（每条记录都有 `id` / `createdAt` / `updatedAt`）
+  - `version(3).stores(...)` 新增 `ovens`（焙炉）与 `ovenRuns`（炉次）两张表，`.upgrade()` 为历史库播种两座默认炉（一号炉 60 kg / 二号炉 45 kg）；历史焙火记录保持不变，炉次排程在打开焙火页时按现有道次自动补齐。
+- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`、`ovens`、`ovenRuns`（每条记录都有 `id` / `createdAt` / `updatedAt`）
+- **两座炉排程**：「待焙且已填复焙日期」的道次按 复焙日期 → 鲜叶重量 → 时长 排入两座炉；同炉同日合计 ≤ 容量可同焙，超容量排队到下一炉次；每炉每日工时 ≤ 24 h。焙火时长或鲜叶重量变动会自动重算；含已开焙（焙火中 / 已足火）道次的炉次冻结保持原样。提交时逐炉比对 `revision`（乐观锁）：另一标签页已先保存时，后保存方保留方案并列出逐炉位冲突，绝不覆盖对方；任一道次排不下则整体不写入（库中保持原排程），对应批次列为待处理。
 - **首屏自动播种**：`initDatabase()` 中 `if ((await db.gardens.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据 —— 3 个山场 → 4 个茶青批次 → 每个批次下 2-3 条做青轮次、1 条杀青揉捻、1-2 道焙火、1 条审评，父→子→孙贯通；播种使用固定 id + `bulkPut`，**幂等**，重复执行不会产生重复行。
 - **级联删除**：删除山场会级联删除其批次与批次下的轮次 / 杀青 / 焙火 / 审评；删除批次会级联删除其全部工序子表（均使用 `db.transaction`）。
-- **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，校验失败弹错误提示）；拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
+- **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，校验失败弹错误提示）；v2 及更早的旧存档缺少焙炉 / 炉次表也可正常导入，导入时自动补种两座默认炉并重排炉次。拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
 - **无命名卷、无数据库服务**：容器只托管静态文件，数据完全存在浏览器本地，换浏览器或清空站点数据即清空。
 
 ---

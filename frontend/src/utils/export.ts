@@ -155,6 +155,9 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
   assertRows(raw.fixes, 'fixes');
   assertRows(raw.roasts, 'roasts');
   assertRows(raw.reviews, 'reviews');
+  // 焙炉 / 炉次为 v3 新增表：旧版存档可缺省，导入时补种默认两座炉
+  if (raw.ovens !== undefined) assertRows(raw.ovens, 'ovens');
+  if (raw.ovenRuns !== undefined) assertRows(raw.ovenRuns, 'ovenRuns');
   return {
     name: DB_NAME,
     schemaVersion: typeof raw.schemaVersion === 'number' ? raw.schemaVersion : DB_VERSION,
@@ -165,6 +168,8 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
     fixes: raw.fixes as DatabaseSnapshot['fixes'],
     roasts: raw.roasts as DatabaseSnapshot['roasts'],
     reviews: raw.reviews as DatabaseSnapshot['reviews'],
+    ovens: Array.isArray(raw.ovens) ? (raw.ovens as DatabaseSnapshot['ovens']) : [],
+    ovenRuns: Array.isArray(raw.ovenRuns) ? (raw.ovenRuns as DatabaseSnapshot['ovenRuns']) : [],
   };
 }
 

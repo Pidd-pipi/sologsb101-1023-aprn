@@ -3,10 +3,14 @@
  * - 多道次按序排列（上移 / 下移写回 passNo）、温度时长与炭种登记
  * - 足火判定（轻火 / 中火 / 足火）与状态流转：待焙 → 焙火中 → 已足火（足火后回写批次为已焙火）
  * - 复焙提醒面板：逾期 / 今日 / 7 日内 / 已排期
+ * - 炭焙间两座炉排程：按复焙日期 / 鲜叶重量 / 焙火时长自动排炉，同炉超容量排队到下一炉次，
+ *   已开焙道次所在炉次保持原样；排不下则恢复原排程并列出待处理批次；
+ *   多标签页同时排同一炉时，后保存的一方保留方案并列出冲突，不覆盖对方
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
   App,
+  Alert,
   Button,
   Card,
   Col,
@@ -28,8 +32,10 @@ import {
   DeleteOutlined,
   EditOutlined,
   FireOutlined,
+  LockOutlined,
   PlusOutlined,
   ReloadOutlined,
+  ScheduleOutlined,
 } from '@ant-design/icons';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import GradeTag from '../components/common/GradeTag';
@@ -45,7 +51,9 @@ import {
   roastsOfBatch,
   useRoastStore,
 } from '../stores/roastStore';
+import { useOvenStore, type RescheduleResult } from '../stores/ovenStore';
 import { CHARCOAL_OPTIONS, ROAST_LIMITS, ROAST_STATES, type Roast, type RoastDraft } from '../types/roast';
+import { OVEN_DAILY_HOURS } from '../types/oven';
 import type { Batch } from '../types/batch';
 import {
   CHARCOAL_COLOR,
@@ -76,12 +84,22 @@ export default function RoastPlan() {
   const advanceRoastState = useRoastStore((state) => state.advanceRoastState);
   const movePass = useRoastStore((state) => state.movePass);
 
+  const ovens = useOvenStore((state) => state.ovens);
+  const ovenRuns = useOvenStore((state) => state.runs);
+  const ovenConflicts = useOvenStore((state) => state.conflicts);
+  const unscheduled = useOvenStore((state) => state.unscheduled);
+  const loadOvens = useOvenStore((state) => state.loadOvens);
+  const reschedule = useOvenStore((state) => state.reschedule);
+  const acceptLatest = useOvenStore((state) => state.acceptLatest);
+
   const [modalOpen, setModalOpen] = useState(false);
   const [editingRoast, setEditingRoast] = useState<Roast | null>(null);
+  const [scheduling, setScheduling] = useState(false);
 
   useEffect(() => {
     void loadRoasts();
-  }, [loadRoasts]);
+    void loadOvens();
+  }, [loadRoasts, loadOvens]);
 
   const gardenMap = useMemo(() => new Map(gardens.map((garden) => [garden.id, garden])), [gardens]);
   const batchMap = useMemo(() => new Map(batches.map((batch) => [batch.id, batch])), [batches]);
@@ -93,6 +111,88 @@ export default function RoastPlan() {
 
   const rows = useMemo(() => filterRoasts(roasts, batches, gardens, roastFilters), [batches, gardens, roastFilters, roasts]);
   const reminders = useMemo(() => buildReminders(roasts), [roasts]);
+
+  /* --------------------------- 两座炉排程派生数据 --------------------------- */
+
+  const roastMap = useMemo(() => new Map(roasts.map((roast) => [roast.id, roast])), [roasts]);
+  const ovenMap = useMemo(() => new Map(ovens.map((oven) => [oven.id, oven])), [ovens]);
+
+  /** 炉次按炉分组，组内按日期 + 炉次序号排列 */
+  const runsByOven = useMemo(
+    () =>
+      ovens.map((oven) => ({
+        oven,
+        list: ovenRuns
+          .filter((run) => run.ovenId === oven.id)
+          .sort((a, b) => a.date.localeCompare(b.date) || a.runNo - b.runNo),
+      })),
+    [ovens, ovenRuns],
+  );
+
+  /** 含已开焙道次的炉次（冻结，重排时保持原样） */
+  const frozenRunIds = useMemo(
+    () =>
+      new Set(
+        ovenRuns
+          .filter((run) => run.roastIds.some((id) => (roastMap.get(id)?.state ?? '待焙') !== '待焙'))
+          .map((run) => run.id),
+      ),
+    [ovenRuns, roastMap],
+  );
+
+  /** 待处理：待焙且已填复焙日期、但未排进任何炉次的道次 */
+  const pendingRoasts = useMemo(() => {
+    const scheduledIds = new Set(ovenRuns.flatMap((run) => run.roastIds));
+    return roasts.filter((roast) => roast.state === '待焙' && roast.nextRoastDate && !scheduledIds.has(roast.id));
+  }, [roasts, ovenRuns]);
+
+  /** 道次展示名：批次标签 + 第 N 道 */
+  const labelOfRoast = (roastId: string): string => {
+    const roast = roastMap.get(roastId);
+    if (!roast) return '已删除道次';
+    return `${labelOfBatch(roast.batchId)} · 第 ${roast.passNo} 道`;
+  };
+
+  /** 冲突条目一侧的文案：成员道次 + 时长 / 总重 */
+  const conflictSide = (roastIds: string[], hours: number | null, kg: number | null): string => {
+    if (roastIds.length === 0) return '空炉位';
+    return `${roastIds.map(labelOfRoast).join('、')}（${hours ?? '-'} h · ${kg ?? '-'} kg）`;
+  };
+
+  /** 重排结果提示文案 */
+  const notifyReschedule = (result: RescheduleResult): void => {
+    if (result === 'ok') message.success('两座炉排程已重算并保存');
+    else if (result === 'noop') message.info('排程已是最新，无需调整');
+    else if (result === 'unscheduled') message.warning('有批次排不下，已恢复原排程并列为待处理');
+    else if (result === 'conflict') message.warning('另一标签页已更新炉次排程，本次未覆盖对方，请查看冲突列表');
+    else message.error('炉次排程保存失败，请重试');
+  };
+
+  const handleReschedule = async (): Promise<void> => {
+    setScheduling(true);
+    try {
+      notifyReschedule(await reschedule());
+    } finally {
+      setScheduling(false);
+    }
+  };
+
+  /** 冲突后：放弃我方未保存方案，载入库中最新排程 */
+  const handleAcceptLatest = async (): Promise<void> => {
+    await acceptLatest();
+    message.info('已放弃未保存的方案，载入最新排程');
+  };
+
+  /** 冲突后：以库中最新数据为基准重新排程（双方的道次改动都会纳入） */
+  const handleReapply = async (): Promise<void> => {
+    setScheduling(true);
+    try {
+      await acceptLatest();
+      notifyReschedule(await reschedule());
+    } finally {
+      setScheduling(false);
+    }
+  };
 
   /** 过滤结果按批次分组 */
   const grouped = useMemo(() => {
@@ -248,7 +348,161 @@ export default function RoastPlan() {
           tone={stats.soonCount > 0 ? 'danger' : 'default'}
           hint="7 日内到期或已逾期的复焙提醒"
         />
+        <StatBadge label="已排炉次" value={ovenRuns.length} suffix="炉" tone="primary" hint="两座炉已排定的炉次总数" />
+        <StatBadge
+          label="待处理批次"
+          value={new Set(pendingRoasts.map((roast) => roast.batchId)).size}
+          suffix="个"
+          tone={pendingRoasts.length > 0 ? 'danger' : 'default'}
+          hint="已填复焙日期但未排进炉次的待焙道次"
+        />
       </div>
+
+      <Card
+        className="panel-card"
+        title={
+          <Space size={8}>
+            <ScheduleOutlined />
+            <span>炭焙间炉次排程</span>
+            {ovens.map((oven) => (
+              <Tag key={oven.id} color="geekblue">
+                {oven.name} · {oven.capacityKg} kg
+              </Tag>
+            ))}
+            {pendingRoasts.length > 0 ? <Tag color="red">待处理 {pendingRoasts.length} 道</Tag> : null}
+          </Space>
+        }
+        extra={
+          <Tooltip title="按复焙日期、鲜叶重量与焙火时长重算两座炉；已开焙道次所在炉次保持原样">
+            <Button size="small" type="primary" ghost icon={<ReloadOutlined />} loading={scheduling} onClick={() => void handleReschedule()}>
+              重新排程
+            </Button>
+          </Tooltip>
+        }
+        style={{ marginBottom: 14 }}
+      >
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 10 }}>
+          待焙且已填复焙日期的道次按「复焙日期 → 鲜叶重量 → 时长」排入两座炉；同炉同日合计不超容量可同焙，
+          超容量即排队到下一炉次；每炉每日工时 ≤ {OVEN_DAILY_HOURS} h。焙火时长或鲜叶重量变动会自动重算，
+          已开焙道次所在炉次保持原样。
+        </Typography.Paragraph>
+
+        {ovenConflicts.length > 0 ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 10 }}
+            message="另一标签页已更新炉次排程：你的方案未保存（未覆盖对方），冲突炉位如下"
+            description={
+              <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                {ovenConflicts.map((conflict) => (
+                  <li key={`${conflict.ovenId}|${conflict.date}|${conflict.runNo}`}>
+                    {ovenMap.get(conflict.ovenId)?.name ?? conflict.ovenId} · {conflict.date} · 第 {conflict.runNo} 炉：
+                    对方 [{conflictSide(conflict.theirs, conflict.theirsHours, conflict.theirsKg)}]
+                    ／ 我方 [{conflictSide(conflict.mine, conflict.mineHours, conflict.mineKg)}]
+                  </li>
+                ))}
+              </ul>
+            }
+            action={
+              <Space direction="vertical" size={4}>
+                <Button size="small" onClick={() => void handleAcceptLatest()}>
+                  放弃我的方案
+                </Button>
+                <Button size="small" type="primary" loading={scheduling} onClick={() => void handleReapply()}>
+                  以最新数据重排
+                </Button>
+              </Space>
+            }
+          />
+        ) : null}
+
+        {unscheduled.length > 0 ? (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 10 }}
+            message="有批次排不下，已恢复原排程"
+            description={
+              <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                {unscheduled.map((item) => (
+                  <li key={item.roastId}>
+                    {labelOfRoast(item.roastId)}（{item.date} · {item.kg} kg）：{item.reason}
+                  </li>
+                ))}
+              </ul>
+            }
+          />
+        ) : null}
+
+        <Row gutter={[14, 14]}>
+          {runsByOven.map(({ oven, list }) => (
+            <Col key={oven.id} xs={24} lg={12}>
+              <div className="oven-col">
+                <Space size={8} wrap>
+                  <strong>{oven.name}</strong>
+                  <Tag>容量 {oven.capacityKg} kg</Tag>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {list.length} 个炉次
+                  </Typography.Text>
+                </Space>
+                {list.length === 0 ? (
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description="暂无炉次：给待焙道次填复焙日期后重新排程"
+                    style={{ margin: '12px 0' }}
+                  />
+                ) : (
+                  list.map((run) => {
+                    const frozen = frozenRunIds.has(run.id);
+                    const overCapacity = run.totalKg > oven.capacityKg;
+                    return (
+                      <div key={run.id} className={`oven-run ${frozen ? 'is-locked' : ''}`}>
+                        <Space size={8} wrap>
+                          <strong className="mono">
+                            {run.date} · 第 {run.runNo} 炉
+                          </strong>
+                          {frozen ? (
+                            <Tag icon={<LockOutlined />} color="processing">
+                              已开焙
+                            </Tag>
+                          ) : null}
+                          <Tag color={overCapacity ? 'red' : 'default'} className={overCapacity ? 'oven-run-over' : ''}>
+                            {run.totalKg} / {oven.capacityKg} kg
+                          </Tag>
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {run.hours} h
+                          </Typography.Text>
+                        </Space>
+                        <div className="oven-run-members">
+                          {run.roastIds.map((roastId) => (
+                            <Tag key={roastId}>{labelOfRoast(roastId)}</Tag>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </Col>
+          ))}
+        </Row>
+
+        {pendingRoasts.length > 0 ? (
+          <div style={{ marginTop: 12 }}>
+            <Typography.Text strong type="danger">
+              待处理批次：
+            </Typography.Text>
+            <Space wrap size={6} style={{ marginLeft: 6 }}>
+              {pendingRoasts.map((roast) => (
+                <Tag key={roast.id} color="red">
+                  {labelOfRoast(roast.id)} · {roast.nextRoastDate}
+                </Tag>
+              ))}
+            </Space>
+          </div>
+        ) : null}
+      </Card>
 
       <Card
         className="panel-card"

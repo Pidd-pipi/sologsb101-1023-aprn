@@ -19,6 +19,12 @@ import {
 import { buildReminder, fireLevelOf, fireLoadOf } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedIncludes, pickedSelect, type FilterValue } from '../components/common/FilterBar';
 import { useBatchStore } from './batchStore';
+import { useOvenStore } from './ovenStore';
+
+/** 道次增删改 / 状态流转后联动重排两座炉（火时长或复焙日期一变即重算炉位） */
+function triggerReschedule(): void {
+  void useOvenStore.getState().reschedule();
+}
 
 /** 焙火页筛选条件默认值：关键字 + 批次 / 道次状态 / 炭种 / 山场四个下拉多选 */
 export const DEFAULT_ROAST_FILTERS: FilterValue = emptyFilterValue(['batchIds', 'states', 'charcoals', 'gardenIds']);
@@ -106,6 +112,7 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     };
     await putRoast(row);
     await get().loadRoasts();
+    triggerReschedule();
     return row;
   },
 
@@ -123,6 +130,7 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     };
     await putRoast(next);
     await get().loadRoasts();
+    triggerReschedule();
   },
 
   async deleteRoast(roastId) {
@@ -134,6 +142,7 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
       await putRoasts(rest.map((roast, index) => ({ ...roast, passNo: index + 1, updatedAt: nowIso() })));
     }
     await get().loadRoasts();
+    triggerReschedule();
   },
 
   async advanceRoastState(roastId) {
@@ -147,6 +156,7 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
       await useBatchStore.getState().markBatchState(existing.batchId, '已焙火');
     }
     await get().loadRoasts();
+    triggerReschedule();
     return next;
   },
 
