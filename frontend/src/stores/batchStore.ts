@@ -245,6 +245,7 @@ export const useBatchStore = create<BatchStoreState>((set, get) => ({
       tenderness: draft.tenderness,
       weather: draft.weather.trim(),
       state: draft.state,
+      roastPending: false,
       createdAt: stamp,
       updatedAt: stamp,
     };

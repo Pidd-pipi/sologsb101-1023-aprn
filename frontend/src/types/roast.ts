@@ -17,6 +17,31 @@ export const ROAST_LIMITS = {
   hours: { min: 0.5, max: 48 },
 } as const;
 
+/* --------------------------- 炭焙间炉位 --------------------------- */
+
+/** 炭焙间炉位枚举（两座炉） */
+export const OVEN_OPTIONS = ['炉一', '炉二'] as const;
+export type OvenId = (typeof OVEN_OPTIONS)[number];
+
+/** 炉位定义：单炉次可容纳的鲜叶总重上限（kg） */
+export interface OvenDef {
+  id: OvenId;
+  /** 炉容量：同一炉次内各道次鲜叶重量合计的上限 */
+  capacityKg: number;
+}
+
+/** 炭焙间两座炉：炉一大容量、炉二小容量 */
+export const OVEN_ROOM: OvenDef[] = [
+  { id: '炉一', capacityKg: 60 },
+  { id: '炉二', capacityKg: 45 },
+];
+
+/** 每日开炉时刻（小时）：复焙日期当天从该时刻起可排炉 */
+export const OVEN_WORKDAY_START_HOUR = 8;
+
+/** 相邻两炉之间的清炉间隔（分钟） */
+export const OVEN_TURNAROUND_MIN = 60;
+
 /** 焙火道次实体（持久化到 IndexedDB 的 roasts 表） */
 export interface Roast {
   id: string;
@@ -34,6 +59,12 @@ export interface Roast {
   nextRoastDate: string;
   /** 焙火状态 */
   state: RoastState;
+  /** 炉位（炉一 / 炉二）；空串表示未排炉 */
+  ovenId: OvenId | '';
+  /** 炉次日期 YYYY-MM-DD；空串表示未排炉 */
+  slotDate: string;
+  /** 当日第几炉（1 起）；0 表示未排炉 */
+  slotSeq: number;
   createdAt: string;
   updatedAt: string;
 }

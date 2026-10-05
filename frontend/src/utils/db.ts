@@ -1,6 +1,7 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）· 库名 gbtearock
- * - 结构版本号 version(1) 初版 + version(DB_VERSION=2) 升级迁移（真实改写历史数据）
+ * - 结构版本号 version(1) 初版 + version(2) 升级迁移（真实改写历史数据）
+ *   + version(DB_VERSION=3) 焙火排程字段迁移（炉位三元组 / 排程待处理标记）
  * - 山场 / 茶青批次 / 做青轮次 / 杀青揉捻 / 焙火 / 审评 六张分表存储
  * - 首屏自动播种互相引用的演示数据（山场 → 批次 → 轮次/杀青/焙火/审评 三层贯通）
  * - 纯前端应用：不依赖任何后端、数据库服务或外部接口
@@ -10,7 +11,7 @@ import { CULTIVAR_OPTIONS, SOIL_OPTIONS, type Garden } from '../types/garden';
 import { BATCH_STATES, type Batch } from '../types/batch';
 import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
-import { ROAST_STATES, type Roast } from '../types/roast';
+import { OVEN_OPTIONS, ROAST_STATES, type Roast } from '../types/roast';
 import type { Review } from '../types/review';
 import { clampScore, weightedTotalScore } from './tea';
 
@@ -18,7 +19,7 @@ import { clampScore, weightedTotalScore } from './tea';
 export const DB_NAME = 'gbtearock';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 主键前缀，便于在导出 JSON 里肉眼区分实体 */
 export const ID_PREFIX = {
@@ -55,7 +56,7 @@ class TeaRockDatabase extends Dexie {
     //     1) 补齐 createdAt / updatedAt；2) 山场补齐朝向、土壤与品种兜底值；
     //     3) 批次工序状态归一化；4) 轮次与焙火数值截断到合法区间；
     //     5) 审评总分由「四项简单平均」改为「分项加权换算」，迁移时按新权重重算。
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         gardens: 'id, name, cultivar, soil, altitudeM, createdAt, updatedAt',
         batches: 'id, gardenId, pickedAt, state, tenderness, createdAt, updatedAt',
@@ -154,6 +155,33 @@ class TeaRockDatabase extends Dexie {
             });
           });
       });
+
+    // v3：炭焙间两座炉排程 —— roasts 补炉位三元组（ovenId / slotDate / slotSeq），
+    //     batches 补 roastPending 待处理标记；索引结构不变，仅迁移历史数据，
+    //     旧记录与既有导出 / 导入照常可用。
+    this.version(DB_VERSION)
+      .stores({})
+      .upgrade(async (tx) => {
+        await tx
+          .table<Roast, string>('roasts')
+          .toCollection()
+          .modify((row) => {
+            if (!(OVEN_OPTIONS as readonly string[]).includes(row.ovenId)) row.ovenId = '';
+            if (typeof row.slotDate !== 'string') row.slotDate = '';
+            if (!Number.isFinite(row.slotSeq) || row.slotSeq < 0) row.slotSeq = 0;
+            if (!row.ovenId) {
+              row.slotDate = '';
+              row.slotSeq = 0;
+            }
+          });
+
+        await tx
+          .table<Batch, string>('batches')
+          .toCollection()
+          .modify((row) => {
+            if (typeof row.roastPending !== 'boolean') row.roastPending = false;
+          });
+      });
   }
 }
 
@@ -247,6 +275,7 @@ export async function seedDatabase(): Promise<void> {
       tenderness: '一芽三叶',
       weather: '晴，北风 2 级，晨露已干',
       state: '已审评',
+      roastPending: false,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -258,6 +287,7 @@ export async function seedDatabase(): Promise<void> {
       tenderness: '开面采',
       weather: '多云，相对湿度 78%',
       state: '已审评',
+      roastPending: false,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -269,6 +299,7 @@ export async function seedDatabase(): Promise<void> {
       tenderness: '一芽两叶',
       weather: '晴热，午后 29 ℃',
       state: '已焙火',
+      roastPending: false,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -280,6 +311,7 @@ export async function seedDatabase(): Promise<void> {
       tenderness: '开面采',
       weather: '阴，间歇小雨，叶面有水',
       state: '做青中',
+      roastPending: false,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -344,6 +376,9 @@ export async function seedDatabase(): Promise<void> {
       charcoal: '荔枝炭',
       nextRoastDate: '',
       state: '已足火',
+      ovenId: '',
+      slotDate: '',
+      slotSeq: 0,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -356,6 +391,9 @@ export async function seedDatabase(): Promise<void> {
       charcoal: '荔枝炭',
       nextRoastDate: shiftDate(-2),
       state: '已足火',
+      ovenId: '',
+      slotDate: '',
+      slotSeq: 0,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -368,6 +406,9 @@ export async function seedDatabase(): Promise<void> {
       charcoal: '龙眼炭',
       nextRoastDate: shiftDate(3),
       state: '焙火中',
+      ovenId: '炉一',
+      slotDate: shiftDate(0),
+      slotSeq: 1,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -380,6 +421,9 @@ export async function seedDatabase(): Promise<void> {
       charcoal: '机制炭',
       nextRoastDate: '',
       state: '待焙',
+      ovenId: '',
+      slotDate: '',
+      slotSeq: 0,
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -590,6 +634,10 @@ export async function listRoastsByBatch(batchId: string): Promise<Roast[]> {
   return rows.sort((a, b) => a.passNo - b.passNo);
 }
 
+export async function getRoast(id: string): Promise<Roast | undefined> {
+  return db.roasts.get(id);
+}
+
 export async function putRoast(row: Roast): Promise<void> {
   await db.roasts.put(row);
 }
@@ -650,6 +698,22 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   return { name: DB_NAME, schemaVersion: DB_VERSION, exportedAt: nowIso(), gardens, batches, turns, fixes, roasts, reviews };
 }
 
+/** 焙火行归一化：旧存档缺少炉位三元组时补默认值，非法炉位清空 */
+function normalizeRoastRow(row: Roast): Roast {
+  const ovenId = (OVEN_OPTIONS as readonly string[]).includes(row.ovenId) ? row.ovenId : '';
+  return {
+    ...row,
+    ovenId,
+    slotDate: ovenId && typeof row.slotDate === 'string' ? row.slotDate : '',
+    slotSeq: ovenId && Number.isFinite(row.slotSeq) && row.slotSeq > 0 ? row.slotSeq : 0,
+  };
+}
+
+/** 批次行归一化：旧存档缺少排程待处理标记时补 false */
+function normalizeBatchRow(row: Batch): Batch {
+  return { ...row, roastPending: typeof row.roastPending === 'boolean' ? row.roastPending : false };
+}
+
 /** 用快照覆盖整库（导入存档） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
@@ -662,10 +726,10 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       db.reviews.clear(),
     ]);
     await db.gardens.bulkPut(snapshot.gardens);
-    await db.batches.bulkPut(snapshot.batches);
+    await db.batches.bulkPut(snapshot.batches.map(normalizeBatchRow));
     await db.turns.bulkPut(snapshot.turns);
     await db.fixes.bulkPut(snapshot.fixes);
-    await db.roasts.bulkPut(snapshot.roasts);
+    await db.roasts.bulkPut(snapshot.roasts.map(normalizeRoastRow));
     await db.reviews.bulkPut(snapshot.reviews);
   });
 }

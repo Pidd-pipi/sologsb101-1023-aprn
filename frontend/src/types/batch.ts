@@ -26,6 +26,8 @@ export interface Batch {
   weather: string;
   /** 工序状态 */
   state: BatchState;
+  /** 炉次排程待处理：排不下时置 true（原排程保持不变），重排成功后自动清除 */
+  roastPending: boolean;
   createdAt: string;
   updatedAt: string;
 }

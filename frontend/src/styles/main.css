@@ -218,6 +218,37 @@ body {
   background: #fffaf0;
 }
 
+.oven-lane {
+  border: 1px solid var(--tea-line);
+  border-radius: 10px;
+  padding: 12px;
+  background: #fffdf7;
+  height: 100%;
+}
+
+.oven-slot {
+  border: 1px dashed var(--tea-line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: #fffef9;
+}
+
+.oven-slot.is-overloaded {
+  border-color: rgba(207, 19, 34, 0.55);
+  background: #fff1f0;
+}
+
+.oven-slot-member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 2px 0;
+  font-size: 12px;
+  color: rgba(43, 42, 38, 0.75);
+}
+
 .candidate-row {
   display: flex;
   align-items: center;

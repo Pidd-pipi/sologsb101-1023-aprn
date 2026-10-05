@@ -3,6 +3,8 @@
  * - 多道次按序排列（上移 / 下移写回 passNo）、温度时长与炭种登记
  * - 足火判定（轻火 / 中火 / 足火）与状态流转：待焙 → 焙火中 → 已足火（足火后回写批次为已焙火）
  * - 复焙提醒面板：逾期 / 今日 / 7 日内 / 已排期
+ * - 炭焙间两座炉排程（OvenBoard）：按重量 / 时长 / 复焙日期装炉，撞炉排队到下一炉，
+ *   多标签页保存冲突时保留输入并列冲突，排不下则恢复原排程并列待处理
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -35,6 +37,7 @@ import FilterBar, { type FilterSelectConfig } from '../components/common/FilterB
 import GradeTag from '../components/common/GradeTag';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
+import OvenBoard from '../components/roasting/OvenBoard';
 import { useGardenStore } from '../stores/gardenStore';
 import { useBatchStore } from '../stores/batchStore';
 import {
@@ -283,6 +286,8 @@ export default function RoastPlan() {
           </Space>
         )}
       </Card>
+
+      <OvenBoard />
 
       <FilterBar
         value={roastFilters}
